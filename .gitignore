@@ -1,0 +1,8 @@
+/model_folder
+/temp
+__pycache__
+*.log
+*.tmp
+/venv
+/ocr_result
+/chroma_db
