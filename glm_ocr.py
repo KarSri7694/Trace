@@ -1,11 +1,11 @@
-from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
-import torch
 import os
-import gc
+import base64
+import json
 from datetime import datetime
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Any, Dict
 import logging
+import requests
 
 # Configure logging
 logging.basicConfig(
@@ -16,28 +16,167 @@ logger = logging.getLogger(__name__)
 
 
 class GLMOCRProcessor:
-    """Reusable OCR processor using GLM-OCR model"""
+    """Reusable OCR processor using a llama.cpp OpenAI-compatible backend"""
     
     def __init__(
         self,
         model_path: str = "zai-org/GLM-OCR",
         cache_dir: str = "./model_folder",
-        use_int8: bool = True
+        use_int8: bool = True,
+        llm_base_url: str = "http://localhost:8080"
     ):
         """
         Initialize the OCR processor
         
         Args:
-            model_path: HuggingFace model path
-            cache_dir: Directory to cache the model
-            use_int8: Whether to use int8 quantization (saves memory)
+            model_path: Model name/path understood by llama.cpp server
+            cache_dir: Kept for backward compatibility (unused by llama.cpp backend)
+            use_int8: Kept for backward compatibility (unused by llama.cpp backend)
+            llm_base_url: Base URL for llama.cpp server
         """
         self.model_path = model_path
         self.cache_dir = cache_dir
         self.use_int8 = use_int8
-        self.processor = None
-        self.model = None
+        self.llm_base_url = llm_base_url.rstrip("/")
+        self.api_uri_v1 = f"{self.llm_base_url}/v1"
+        self._model_load_endpoint = f"{self.llm_base_url}/models/load"
+        self._model_unload_endpoint = f"{self.llm_base_url}/models/unload"
+        self._timeout = 120
+        self._requests_session: Optional[requests.Session] = None
+        self.currently_loaded_model: Optional[str] = None
+        self._effective_model_name: str = model_path
         self.is_loaded = False
+
+    def _get_session(self) -> requests.Session:
+        if self._requests_session is None:
+            self._requests_session = requests.Session()
+        return self._requests_session
+
+    def _check_server_status(self) -> bool:
+        try:
+            response = self._get_session().get(f"{self.llm_base_url}/health", timeout=5)
+            return response.status_code == 200
+        except requests.RequestException:
+            # Some llama.cpp wrappers do not expose /health; try /v1/models as fallback.
+            try:
+                response = self._get_session().get(f"{self.api_uri_v1}/models", timeout=8)
+                return response.status_code == 200
+            except requests.RequestException:
+                return False
+
+    def _try_load_remote_model(self) -> bool:
+        """Try explicit model load endpoint; succeed silently when endpoint is unavailable."""
+        payload = {"model": self.model_path}
+        try:
+            response = self._get_session().post(self._model_load_endpoint, json=payload, timeout=self._timeout)
+            if response.status_code == 200:
+                return True
+            logger.warning(
+                "Model load endpoint returned status %s: %s",
+                response.status_code,
+                response.text,
+            )
+            return False
+        except requests.RequestException:
+            # Endpoint may not exist in all llama.cpp distributions; continue if chat endpoint works.
+            logger.info("Model load endpoint not available; assuming model is managed externally")
+            return True
+
+    def _fetch_available_models(self) -> list[str]:
+        """Read model ids from OpenAI-compatible /v1/models response."""
+        try:
+            response = self._get_session().get(f"{self.api_uri_v1}/models", timeout=8)
+            response.raise_for_status()
+            data = response.json()
+        except Exception:
+            return []
+
+        discovered: list[str] = []
+
+        for item in data.get("data", []):
+            model_id = item.get("id")
+            if isinstance(model_id, str) and model_id.strip():
+                discovered.append(model_id.strip())
+
+        for item in data.get("models", []):
+            if isinstance(item, dict):
+                for key in ("model", "name"):
+                    value = item.get(key)
+                    if isinstance(value, str) and value.strip():
+                        discovered.append(value.strip())
+
+        # Preserve order while removing duplicates.
+        return list(dict.fromkeys(discovered))
+
+    def _resolve_effective_model_name(self, available_models: list[str]) -> str:
+        """Pick a model id that actually exists in the running server."""
+        if not available_models:
+            return self.model_path
+
+        configured = self.model_path.strip()
+        configured_lower = configured.lower()
+        configured_name = Path(configured).name.strip().lower()
+
+        for candidate in available_models:
+            if candidate == configured:
+                return candidate
+
+        for candidate in available_models:
+            if candidate.lower() == configured_lower:
+                return candidate
+
+        for candidate in available_models:
+            if Path(candidate).name.strip().lower() == configured_name:
+                return candidate
+
+        logger.warning(
+            "Configured OCR model '%s' not found on server. Falling back to '%s'.",
+            self.model_path,
+            available_models[0],
+        )
+        return available_models[0]
+
+    @staticmethod
+    def _extract_text_from_response(data: Dict[str, Any]) -> str:
+        choices = data.get("choices") or []
+        if not choices:
+            return ""
+
+        message = choices[0].get("message") or {}
+        content = message.get("content", "")
+
+        if isinstance(content, str):
+            return content
+
+        if isinstance(content, list):
+            chunks = []
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if text:
+                        chunks.append(str(text))
+                elif item:
+                    chunks.append(str(item))
+            return "\n".join(chunks)
+
+        return str(content) if content is not None else ""
+
+    @staticmethod
+    def _to_data_url(image_path: str) -> str:
+        ext = Path(image_path).suffix.lower().lstrip(".")
+        mime_map = {
+            "jpg": "image/jpeg",
+            "jpeg": "image/jpeg",
+            "png": "image/png",
+            "gif": "image/gif",
+            "bmp": "image/bmp",
+            "tiff": "image/tiff",
+            "webp": "image/webp",
+        }
+        mime_type = mime_map.get(ext, "image/png")
+        with open(image_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+        return f"data:{mime_type};base64,{b64}"
     
     def load_model(self) -> bool:
         """
@@ -51,37 +190,27 @@ class GLMOCRProcessor:
             return True
         
         try:
-            logger.info("Loading GLM-OCR model with int8 quantization...")
-            
-            # Load processor
-            self.processor = AutoProcessor.from_pretrained(
-                self.model_path,
-                cache_dir=self.cache_dir
-            )
-            
-            # Configure quantization
-            quantization_config = None
-            if self.use_int8:
-                try:
-                    quantization_config = BitsAndBytesConfig(
-                        load_in_8bit=True,
-                        llm_int8_threshold=6.0
-                    )
-                except Exception as e:
-                    logger.warning(f"Could not configure int8 quantization: {e}")
-                    logger.warning("Loading model without quantization (will use more memory)")
-                    quantization_config = None
-            
-            # Load model
-            self.model = AutoModelForImageTextToText.from_pretrained(
-                pretrained_model_name_or_path=self.model_path,
-                quantization_config=quantization_config,
-                device_map="auto",
-                cache_dir=self.cache_dir
-            )
-            
+            logger.info("Initializing llama.cpp OCR backend...")
+
+            if not self._check_server_status():
+                logger.error("llama.cpp server is not reachable at %s", self.llm_base_url)
+                return False
+
+            # Best-effort load; some deployments load models externally.
+            self._try_load_remote_model()
+
+            available_models = self._fetch_available_models()
+            if not available_models:
+                logger.error(
+                    "No models are available on llama.cpp server. "
+                    "Start server with a model (and mmproj for vision models)."
+                )
+                return False
+
+            self._effective_model_name = self._resolve_effective_model_name(available_models)
+            self.currently_loaded_model = self._effective_model_name
             self.is_loaded = True
-            logger.info("GLM-OCR model loaded successfully")
+            logger.info("llama.cpp OCR backend initialized successfully")
             return True
             
         except Exception as e:
@@ -107,44 +236,47 @@ class GLMOCRProcessor:
         """
         if not self.is_loaded:
             raise RuntimeError("Model not loaded. Call load_model() first.")
+
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"Image not found: {image_path}")
         
         logger.info(f"Processing image: {Path(image_path).name}")
-        
-        # Prepare messages
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "url": image_path},
-                    {"type": "text", "text": prompt}
-                ],
-            }
-        ]
-        
-        # Process image
-        inputs = self.processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt"
-        ).to(self.model.device)
-        inputs.pop("token_type_ids", None)
-        
-        # Generate OCR output
-        generated_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
-        output_text = self.processor.decode(
-            generated_ids[0][inputs["input_ids"].shape[1]:],
-            skip_special_tokens=False
-        )
-        
-        # Clear memory
-        del inputs
-        del generated_ids
-        
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
+
+        image_data_url = self._to_data_url(image_path)
+        payload = {
+            "model": self._effective_model_name,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": image_data_url}},
+                    ],
+                }
+            ],
+            "stream": False,
+            "max_tokens": int(max_new_tokens),
+            "temperature": 0.0,
+        }
+
+        try:
+            response = self._get_session().post(
+                f"{self.api_uri_v1}/chat/completions",
+                json=payload,
+                timeout=self._timeout,
+            )
+            response.raise_for_status()
+        except requests.RequestException as e:
+            raise RuntimeError(f"llama.cpp OCR request failed: {e}") from e
+
+        try:
+            data = response.json()
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Invalid JSON response from llama.cpp: {response.text[:500]}") from e
+
+        output_text = self._extract_text_from_response(data)
+        if not output_text:
+            output_text = ""
         
         logger.info(f"OCR completed for: {Path(image_path).name}")
         return output_text
@@ -192,21 +324,34 @@ class GLMOCRProcessor:
         """Unload the model to free memory"""
         if self.is_loaded:
             logger.info("Unloading OCR model...")
-            del self.model
-            del self.processor
-            self.model = None
-            self.processor = None
+
+            # Best effort unload; many llama.cpp setups manage model lifecycle externally.
+            if self.currently_loaded_model:
+                payload = {"model": self.currently_loaded_model}
+                try:
+                    self._get_session().post(self._model_unload_endpoint, json=payload, timeout=30)
+                except requests.RequestException:
+                    logger.info("Model unload endpoint not available; skipping explicit unload")
+                except Exception:
+                    # During interpreter teardown, requests internals can be partially unloaded.
+                    logger.info("Model unload endpoint not available; skipping explicit unload")
+
+            if self._requests_session is not None:
+                self._requests_session.close()
+                self._requests_session = None
+
+            self.currently_loaded_model = None
             self.is_loaded = False
-            
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
-            
+
             logger.info("OCR model unloaded")
     
     def __del__(self):
         """Cleanup when object is destroyed"""
-        self.unload_model()
+        try:
+            self.unload_model()
+        except Exception:
+            # Avoid raising during interpreter shutdown.
+            pass
 
 
 # Standalone script functionality (backward compatibility)

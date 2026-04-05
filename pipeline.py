@@ -42,9 +42,12 @@ class PrivacyScanner:
             db_path: Path to ChromaDB storage
         """
         self.llm_client = None
-        self.ocr_processor = GLMOCRProcessor(model_path=ocr_model_path) if enable_ocr else None
-        self.output_folder = output_folder
         self.llm_base_url = llm_base_url
+        self.ocr_processor = (
+            GLMOCRProcessor(model_path=ocr_model_path, llm_base_url=self.llm_base_url)
+            if enable_ocr else None
+        )
+        self.output_folder = output_folder
         self.enable_encoding = enable_encoding
         self.enable_ocr = enable_ocr
         self.db_path = db_path
