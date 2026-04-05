@@ -24,7 +24,8 @@ class PrivacyScanner:
     def __init__(
         self,
         llm_base_url: str = "http://localhost:8080",
-        ocr_model_path: str = "zai-org/GLM-OCR",
+        ocr_model_path: str = "GLM-OCR",
+        llm_model_path: str = "Qwen3-4B-Instruct-2507-Q4_K_M",
         output_folder: str = "ocr_result",
         enable_encoding: bool = True,
         enable_ocr: bool = True,
@@ -36,6 +37,7 @@ class PrivacyScanner:
         Args:
             llm_base_url: URL for llama.cpp server
             ocr_model_path: Path to GLM-OCR model
+            llm_model_path: Model alias/path for text privacy analysis
             output_folder: Folder to save OCR results
             enable_encoding: Whether to encode OCR results to vector database
             enable_ocr: Whether to run OCR on images
@@ -43,6 +45,7 @@ class PrivacyScanner:
         """
         self.llm_client = None
         self.llm_base_url = llm_base_url
+        self.llm_model_path = llm_model_path
         self.ocr_processor = (
             GLMOCRProcessor(model_path=ocr_model_path, llm_base_url=self.llm_base_url)
             if enable_ocr else None
@@ -56,13 +59,23 @@ class PrivacyScanner:
         os.makedirs(output_folder, exist_ok=True)
     
     def initialize_llm(self) -> bool:
-        """Initialize the LLM client and check if server is running"""
+        """Initialize/load the LLM model for text privacy analysis"""
         try:
             logger.info("Initializing LLM client...")
-            self.llm_client = LlamaCppClient(base_url=self.llm_base_url)
+
+            if self.llm_client is None:
+                self.llm_client = LlamaCppClient(
+                    base_url=self.llm_base_url,
+                    model_name=self.llm_model_path
+                )
             
             if not self.llm_client.check_server_status():
                 logger.error("LLM server is not responding")
+                return False
+
+            logger.info("Loading LLM model: %s", self.llm_model_path)
+            if not self.llm_client.load_model(self.llm_model_path):
+                logger.error("Failed to load LLM model: %s", self.llm_model_path)
                 return False
             
             logger.info("LLM client initialized successfully")
@@ -91,6 +104,14 @@ class PrivacyScanner:
         """Unload OCR model to free memory using GLMOCRProcessor"""
         if self.ocr_processor is not None:
             self.ocr_processor.unload_model()
+
+    def unload_llm(self):
+        """Unload LLM model to free memory on shared llama.cpp server"""
+        if self.llm_client is not None:
+            try:
+                self.llm_client.unload_model(self.llm_model_path)
+            except Exception as e:
+                logger.warning(f"Failed to unload LLM model: {e}")
     
     def encode_ocr_results(self, scan_directory: str = ".", progress_callback=None) -> Dict:
         """
@@ -448,6 +469,14 @@ class PrivacyScanner:
             logger.warning("No images found in the specified directory")
             return results
         
+        # Ensure LLM model is not occupying memory before OCR phase.
+        if self.llm_client is None:
+            self.llm_client = LlamaCppClient(
+                base_url=self.llm_base_url,
+                model_name=self.llm_model_path
+            )
+        self.unload_llm()
+
         # Step 2: Initialize OCR
         if progress_callback:
             progress_callback(5, 100, "Loading OCR model...")
@@ -455,17 +484,8 @@ class PrivacyScanner:
         if not self.initialize_ocr():
             logger.error("Failed to initialize OCR model")
             return results
-        
-        # Step 3: Initialize LLM
-        if progress_callback:
-            progress_callback(10, 100, "Connecting to LLM server...")
-        
-        if not self.initialize_llm():
-            logger.error("Failed to initialize LLM client")
-            self.unload_ocr()
-            return results
-        
-        # Step 4: Process each image (OCR only - analysis happens later if enabled)
+
+        # Step 3: Process each image (OCR only - analysis happens later if enabled)
         total_images = len(image_files)
         for idx, image_path in enumerate(image_files, 1):
             try:
@@ -501,16 +521,24 @@ class PrivacyScanner:
                     "timestamp": datetime.now().isoformat()
                 })
         
-        # Step 5: Cleanup OCR model
+        # Step 4: Cleanup OCR model
         if progress_callback:
             progress_callback(75, 100, "Unloading OCR model...")
         
         self.unload_ocr()
         logger.info("OCR model unloaded, memory freed")
+
+        # Step 5: Initialize/load LLM model after OCR is fully unloaded.
+        if progress_callback:
+            progress_callback(78, 100, f"Loading LLM model ({self.llm_model_path})...")
+
+        if not self.initialize_llm():
+            logger.error("Failed to initialize LLM client")
+            return results
         
         # Step 6: Analyze text/markdown files (ALWAYS - these should only be analyzed once)
         if progress_callback:
-            progress_callback(78, 100, "Scanning for text/markdown files...")
+            progress_callback(82, 100, "Scanning for text/markdown files...")
         
         text_files = self.get_text_files(directory, recursive)
         
@@ -520,7 +548,7 @@ class PrivacyScanner:
             
             for idx, text_file in enumerate(text_files, 1):
                 try:
-                    progress = 78 + int((idx / total_text_files) * 10)
+                    progress = 82 + int((idx / total_text_files) * 6)
                     if progress_callback:
                         progress_callback(
                             progress,
@@ -602,6 +630,8 @@ def main():
     parser.add_argument("directory", help="Directory to scan")
     parser.add_argument("-r", "--recursive", action="store_true", help="Scan subdirectories")
     parser.add_argument("--llm-url", default="http://localhost:8080", help="LLM server URL")
+    parser.add_argument("--llm-model", default="Qwen3-4B-Instruct-2507-Q4_K_M", help="LLM model alias/path")
+    parser.add_argument("--ocr-model", default="GLM-OCR", help="OCR model alias/path")
     parser.add_argument("-o", "--output", default="ocr_result", help="Output folder")
     parser.add_argument("--no-encoding", action="store_true", help="Disable vector database encoding")
     parser.add_argument("--db-path", default="./chroma_db", help="ChromaDB storage path")
@@ -610,6 +640,8 @@ def main():
     
     scanner = PrivacyScanner(
         llm_base_url=args.llm_url,
+        ocr_model_path=args.ocr_model,
+        llm_model_path=args.llm_model,
         output_folder=args.output,
         enable_encoding=not args.no_encoding,
         db_path=args.db_path

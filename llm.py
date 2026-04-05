@@ -3,29 +3,178 @@ import json
 import re
 from typing import List, Dict, Optional, Union
 from openai import OpenAI
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 
 class LlamaCppClient:
     """Client for interacting with llama.cpp server using OpenAI Chat Completions API"""
     
-    def __init__(self, base_url: str = "http://localhost:8080", api_key: str = "not-needed"):
+    def __init__(
+        self,
+        base_url: str = "http://localhost:8080",
+        api_key: str = "not-needed",
+        model_name: str = "Qwen3-4B-Instruct-2507-Q4_K_M"
+    ):
         """
         Initialize the llama.cpp client
         
         Args:
             base_url: URL where llama.cpp server is running (default: http://localhost:8080)
             api_key: API key (not needed for local llama.cpp server, but required by OpenAI client)
+            model_name: Default model alias/name to use for text analysis
         """
-        self.base_url = base_url
+        self.base_url = base_url.rstrip("/")
+        self.api_uri_v1 = f"{self.base_url}/v1"
+        self._model_load_endpoint = f"{self.base_url}/models/load"
+        self._model_unload_endpoint = f"{self.base_url}/models/unload"
+        self.model_name = model_name
+        self.currently_loaded_model: Optional[str] = None
+        self._requests_session = requests.Session()
         self.client = OpenAI(
-            base_url=f"{base_url}/v1",
+            base_url=self.api_uri_v1,
             api_key=api_key
         )
+
+    def _get_session(self) -> requests.Session:
+        return self._requests_session
+
+    def _fetch_available_models(self) -> List[str]:
+        """Read model ids from OpenAI-compatible /v1/models response."""
+        try:
+            response = self._get_session().get(f"{self.api_uri_v1}/models", timeout=8)
+            response.raise_for_status()
+            data = response.json()
+        except Exception:
+            return []
+
+        discovered: List[str] = []
+
+        for item in data.get("data", []):
+            model_id = item.get("id")
+            if isinstance(model_id, str) and model_id.strip():
+                discovered.append(model_id.strip())
+
+        for item in data.get("models", []):
+            if isinstance(item, dict):
+                for key in ("model", "name"):
+                    value = item.get(key)
+                    if isinstance(value, str) and value.strip():
+                        discovered.append(value.strip())
+
+        # Preserve order while removing duplicates.
+        return list(dict.fromkeys(discovered))
+
+    def _resolve_effective_model_name(self, requested_model: str, available_models: List[str]) -> str:
+        if not available_models:
+            return requested_model
+
+        requested = requested_model.strip()
+        requested_lower = requested.lower()
+        requested_name = requested.replace("\\", "/").split("/")[-1].lower()
+
+        for candidate in available_models:
+            if candidate == requested:
+                return candidate
+
+        for candidate in available_models:
+            if candidate.lower() == requested_lower:
+                return candidate
+
+        for candidate in available_models:
+            candidate_name = candidate.replace("\\", "/").split("/")[-1].lower()
+            if candidate_name == requested_name:
+                return candidate
+
+        logger.warning(
+            "Configured LLM model '%s' not found on server. Falling back to '%s'.",
+            requested_model,
+            available_models[0],
+        )
+        return available_models[0]
+
+    def load_model(self, model_name: Optional[str] = None) -> bool:
+        """
+        Best-effort model load for llama.cpp-compatible servers.
+
+        Returns:
+            True if model appears ready for use, False if server is unreachable.
+        """
+        target_model = (model_name or self.model_name or "").strip()
+        if not target_model:
+            logger.error("No LLM model name provided")
+            return False
+
+        if not self.check_server_status():
+            logger.error("LLM server is not responding at %s", self.base_url)
+            return False
+
+        # Some wrappers support /models/load, standard llama-server may not.
+        try:
+            response = self._get_session().post(
+                self._model_load_endpoint,
+                json={"model": target_model},
+                timeout=120
+            )
+            if response.status_code == 200:
+                logger.info("Loaded LLM model via endpoint: %s", target_model)
+            else:
+                logger.warning(
+                    "LLM load endpoint returned status %s: %s",
+                    response.status_code,
+                    response.text,
+                )
+        except requests.RequestException:
+            logger.info("LLM load endpoint not available; assuming model is managed externally")
+
+        available_models = self._fetch_available_models()
+        if available_models:
+            self.currently_loaded_model = self._resolve_effective_model_name(target_model, available_models)
+        else:
+            # Fallback when server does not expose model listing.
+            self.currently_loaded_model = target_model
+
+        return True
+
+    def unload_model(self, model_name: Optional[str] = None) -> bool:
+        """
+        Best-effort model unload for llama.cpp-compatible servers.
+
+        Returns:
+            True when unload succeeded or endpoint is unavailable, False on explicit HTTP failure.
+        """
+        target_model = (model_name or self.currently_loaded_model or self.model_name or "").strip()
+        if not target_model:
+            return True
+
+        try:
+            response = self._get_session().post(
+                self._model_unload_endpoint,
+                json={"model": target_model},
+                timeout=60
+            )
+            if response.status_code == 200:
+                logger.info("Unloaded LLM model via endpoint: %s", target_model)
+                if self.currently_loaded_model == target_model:
+                    self.currently_loaded_model = None
+                return True
+
+            logger.warning(
+                "LLM unload endpoint returned status %s: %s",
+                response.status_code,
+                response.text,
+            )
+            return False
+        except requests.RequestException:
+            logger.info("LLM unload endpoint not available; skipping explicit unload")
+            return True
     
     def chat_completion(
         self,
         messages: List[Dict[str, str]],
-        model: str = "Qwen3-4B-Instruct-2507-Q4_K_M",
+        model: Optional[str] = None,
         stream: bool = False,
         **kwargs
     ):
@@ -43,9 +192,16 @@ class LlamaCppClient:
         Returns:
             Response from the model
         """
+        requested_model = model or self.currently_loaded_model or self.model_name
+
+        # Ensure a model is ready when this client instance hasn't loaded one yet.
+        if self.currently_loaded_model is None:
+            self.load_model(requested_model)
+            requested_model = self.currently_loaded_model or requested_model
+
         try:
             response = self.client.chat.completions.create(
-                model=model,
+                model=requested_model,
                 messages=messages,
                 stream=stream,
                 **kwargs
@@ -111,8 +267,13 @@ class LlamaCppClient:
         try:
             response = requests.get(f"{self.base_url}/health", timeout=5)
             return response.status_code == 200
-        except:
-            return False
+        except Exception:
+            # Some deployments may not expose /health; /v1/models is a good fallback.
+            try:
+                response = requests.get(f"{self.api_uri_v1}/models", timeout=8)
+                return response.status_code == 200
+            except Exception:
+                return False
     
     def query_with_json_response(
         self,

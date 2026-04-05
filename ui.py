@@ -2200,11 +2200,20 @@ Total documents in database: {encoder.collection.count()}
                 
                 # Initialize LLM client
                 llm_client = LlamaCppClient(base_url=llm_url)
+                llm_model_name = getattr(self.scanner, "llm_model_path", "Qwen3-4B-Instruct-2507-Q4_K_M")
                 
                 if not llm_client.check_server_status():
                     self.app.after(0, lambda: messagebox.showerror(
                         "LLM Server Not Found",
                         f"LLM server is not running at {llm_url}\n\nPlease start llama.cpp server first."
+                    ))
+                    self.app.after(0, lambda: self.progress_bar.set(0))
+                    return
+
+                if not llm_client.load_model(llm_model_name):
+                    self.app.after(0, lambda: messagebox.showerror(
+                        "LLM Model Load Failed",
+                        f"Could not load LLM model '{llm_model_name}' from server at {llm_url}."
                     ))
                     self.app.after(0, lambda: self.progress_bar.set(0))
                     return
